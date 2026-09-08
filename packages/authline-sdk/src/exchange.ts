@@ -5,10 +5,12 @@ import {
 	BASE_FEE,
 	Contract,
 	Operation,
+	StrKey,
 	TransactionBuilder,
 	rpc,
 } from "@stellar/stellar-sdk"
 import { defaultAllowHttp } from "./onboard.js"
+import { SEP7_MSG_MAX, sep7HandlerUrl, sep7SigningPayload } from "./sep7.js"
 import { type OnboarderConfig } from "./index.js"
 
 /**
@@ -146,23 +148,9 @@ export async function buildSponsoredOnboardTx(opts: {
 	return b.setTimeout(180).build().toXDR()
 }
 
-/** SEP-7 caps `msg` at 300 characters before URL-encoding. */
-export const SEP7_MSG_MAX = 300
-
-/**
- * The SEP-7 signing payload: 35 zero bytes, then a `4` byte (envelope type),
- * then the fixed scheme prefix concatenated directly onto the URI request —
- * the request WITHOUT its `signature` parameter, which is why the signature is
- * appended last.
- */
-function sep7Payload(uriWithoutSignature: string): Buffer {
-	const prefix = Buffer.alloc(36)
-	prefix[35] = 4
-	return Buffer.concat([
-		prefix,
-		Buffer.from(`stellar.sep.7 - URI Scheme${uriWithoutSignature}`, "utf8"),
-	])
-}
+// The SEP-7 constants and signing payload live with the wallet-side helpers
+// (sep7.ts) so the emitter and the verifier can never drift apart.
+export { SEP7_MSG_MAX } from "./sep7.js"
 
 /**
  * Signs a SEP-7 request payload. `Keypair` from `@stellar/stellar-sdk`
@@ -240,6 +228,15 @@ export interface OnboardingRequest {
 	 * onboarding but are NOT the same transaction.
 	 */
 	hostedUrl?: string
+	/**
+	 * The SAME SEP-7 request, wrapped for a hosted page that receives
+	 * `web+stellar:` requests (the Authline activation page does:
+	 * `app.html?sep7=…`). Present only with `hostedBase`. For a user whose
+	 * wallet registered no `web+stellar:` handler this is the link that still
+	 * works — it opens in any browser and the page hands the signature to the
+	 * user's wallet (browser extension, Albedo, Nido…).
+	 */
+	handlerUrl?: string
 }
 
 /**
@@ -273,6 +270,13 @@ export function onboardingRequest(opts: {
 	callback?: string
 	/** Base URL of the hosted activation page. */
 	hostedBase?: string
+	/**
+	 * SEP-7 `pubkey`: the account expected to sign. Defaults to `userAddress`,
+	 * which is right for every onboarding shape — including the sponsored one,
+	 * whose envelope the sponsor sources, so a wallet must not infer the
+	 * signer from the transaction source.
+	 */
+	pubkey?: string | null
 	/**
 	 * Optional human message shown by the wallet (SEP-7 `msg`). Capped by the
 	 * spec at {@link SEP7_MSG_MAX} characters before URL-encoding.
@@ -319,6 +323,9 @@ export function onboardingRequest(opts: {
 	const params = new URLSearchParams()
 	params.set("xdr", opts.txXdr)
 	params.set("network_passphrase", opts.networkPassphrase)
+	const pubkey = opts.pubkey === undefined ? opts.userAddress : opts.pubkey
+	if (pubkey && StrKey.isValidEd25519PublicKey(pubkey))
+		params.set("pubkey", pubkey)
 	if (opts.callback) {
 		// SEP-7 namespaces the callback value; only `url:` is defined today.
 		params.set(
@@ -331,7 +338,7 @@ export function onboardingRequest(opts: {
 
 	let sep7 = `web+stellar:tx?${params.toString()}`
 	if (opts.signer) {
-		const sig = opts.signer.sign(sep7Payload(sep7))
+		const sig = opts.signer.sign(sep7SigningPayload(sep7))
 		// Appended last, and by hand: the wallet recovers the payload by
 		// stripping this trailing parameter, so it must stay at the end and must
 		// be encoded exactly as we signed the rest.
@@ -344,6 +351,7 @@ export function onboardingRequest(opts: {
 	if (opts.hostedBase) {
 		const base = opts.hostedBase.replace(/\/$/, "")
 		out.hostedUrl = `${base}?address=${encodeURIComponent(opts.userAddress)}`
+		out.handlerUrl = sep7HandlerUrl(base, sep7)
 	}
 	return out
 }

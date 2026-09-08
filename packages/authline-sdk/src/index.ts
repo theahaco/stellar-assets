@@ -84,6 +84,22 @@ export {
 	type OnboardingRequest,
 	type Sep7Signer,
 } from "./exchange.js"
+// Wallet side of the SEP-7 handoff: parse, verify, explain, and return via
+// `callback` a `web+stellar:tx` request that `onboardingRequest` emitted.
+export {
+	parseSep7TxRequest,
+	verifySep7Signature,
+	fetchSep7SigningKey,
+	signingKeyFromToml,
+	sep7SigningPayload,
+	describeSep7Tx,
+	sep7Signer,
+	postSep7Callback,
+	sep7HandlerUrl,
+	type Sep7TxRequest,
+	type Sep7TxSummary,
+	type Sep7OpSummary,
+} from "./sep7.js"
 // Sponsorship: who pays the reserve (CAP-33) and the fee (CAP-15 fee bump),
 // plus the safety check an operations account MUST run before signing.
 export { assertSafeToSponsor, buildFeeBump } from "./sponsor.js"

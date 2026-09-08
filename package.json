@@ -23,6 +23,7 @@
     "typecheck": "tsc",
     "deploy:testnet-sac": "node scripts/deploy-testnet-usdc-sac.mjs",
     "send:claimable": "node scripts/send-test-claimable.mjs",
+    "fund:treasury": "npm run build -w @theahaco/authline && node scripts/fund-relayer-treasury.mjs",
     "authorizer": "node scripts/authorizer.mjs",
     "prove": "npm run build -w @theahaco/authline && node scripts/prove-cases.mjs",
     "prove:authorizer": "npm run build -w @theahaco/authline && npm run build:contracts && node scripts/prove-authorizer.mjs",
@@ -35,16 +36,18 @@
   ],
   "dependencies": {
     "@creit.tech/stellar-wallets-kit": "^2.3.0",
+    "@g2c/stellar-wallets-kit-module": "*",
     "@stellar/stellar-sdk": "^14.4.3",
     "@stellar/stellar-xdr-json": "^23.0.0",
-    "@g2c/stellar-wallets-kit-module": "*",
     "@theahaco/authline": "^0.5.0",
     "@theahaco/ts-config": "^1.2.0",
+    "qrcode": "^1.5.4",
     "react": "^19.2.4",
     "react-dom": "^19.2.4"
   },
   "devDependencies": {
     "@playwright/test": "^1.60.0",
+    "@types/qrcode": "^1.5.6",
     "@types/react": "^19.2.10",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^5.1.2",

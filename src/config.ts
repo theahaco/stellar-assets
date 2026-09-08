@@ -279,6 +279,21 @@ export const ASSETS: DirItem[] = [
 export const REPO_URL = "https://github.com/theahaco/authline"
 
 /**
+ * Authline relayer base URL (docs/relayer-runbook.md). The reference
+ * withdrawal screen (withdraw.html) uses it as its "exchange backend": the
+ * relayer builds and SIGNS the SEP-7 request (`POST /v1/sep7/request`) and
+ * receives the signed envelope back (`POST /v1/sep7/callback`). Set
+ * PUBLIC_RELAYER_URL=none to disable; defaults to the hosted testnet instance.
+ */
+const relayerEnv = env(import.meta.env.PUBLIC_RELAYER_URL)
+export const RELAYER_URL: string | undefined =
+	relayerEnv === "none"
+		? undefined
+		: (relayerEnv ??
+			(NET_TAG === "TESTNET" ? "https://authline-relayer.fly.dev" : undefined))
+warnIfInvalid("RELAYER_URL", RELAYER_URL, "url")
+
+/**
  * Base domain of the Nido hosted passkey wallet (theahaco/nido). The wallets-
  * kit module derives `<base>/connect/` and `<account>.<base>/sign/` from it.
  * Nido is testnet-only today; the dApp registers its module only on testnet.

@@ -3,15 +3,23 @@
 # Build from the REPO ROOT (the relayer builds against the workspace SDK):
 #   docker build -f packages/relayer/Dockerfile -t authline-relayer .
 # Run:
-#   docker run -p 8787:8787 -e RELAYER_SECRET=S... authline-relayer
+#   docker run -p 8787:8787 -e RELAYER_SECRET=S... \
+#     -e RELAYER_API_TOKEN=<16+ chars> authline-relayer
 #
 # Configuration (see docs/relayer-runbook.md):
-#   RELAYER_SECRET     required — funded, LOW-PRIVILEGE ops account (fees only)
+#   RELAYER_SECRET     required — funded, LOW-PRIVILEGE ops account (fees only;
+#                      boot refuses an authorizer admin or asset issuer key)
+#   RELAYER_API_TOKEN  Bearer token for POST /authorize, min 16 chars.
+#                      REQUIRED unless HOST is loopback (open authorize spends XLM)
 #   STELLAR_NETWORK    TESTNET (default) | PUBLIC
 #   RPC_URL            override the default Stellar RPC endpoint
-#   RELAYER_API_TOKEN  when set, POST /authorize requires Bearer auth
 #   DEFAULT_ASSET      asset code when ?asset= is omitted (default EURCV)
 #   PORT               listen port (default 8787)
+#   HOST               bind interface (default 0.0.0.0)
+#   RATE_LIMIT_RPM     per-IP requests/minute on /v1 routes (default 120, 0 = off)
+#   MAX_INFLIGHT       max concurrent /v1 requests, 503 beyond (default 8, 0 = off)
+#   TRUST_PROXY        1/true — take client IP from Fly-Client-IP / X-Forwarded-For
+#                      (only behind a trusted proxy)
 
 FROM node:22-alpine AS build
 WORKDIR /app

@@ -32,6 +32,21 @@ discovery), a pinned `OFFICIAL_ASSETS` registry, an optional headless
 There is **no Authline authorizer** — `authorize_trustline` is satisfied by
 `eurcv_auth`.
 
+#### SEP-7 handoff (wallet side)
+
+`onboardingRequest()` emits a `web+stellar:tx` request; these are what the page
+that _receives_ one needs (the Authline activation page is one such receiver:
+`app.html?sep7=…` — see [sep7-handoff.md](sep7-handoff.md)):
+
+| Function                | Role                                                                     |
+| ----------------------- | ------------------------------------------------------------------------ |
+| `parseSep7TxRequest()`  | parse + validate a `tx` request, refusing other networks before decoding |
+| `fetchSep7SigningKey()` | read `URI_REQUEST_SIGNING_KEY` from `origin_domain`'s `stellar.toml`     |
+| `verifySep7Signature()` | check the request's `signature` against that key                         |
+| `describeSep7Tx()`      | explain the envelope: ops, signers, fee — recognises the router onboard  |
+| `postSep7Callback()`    | return the signed envelope to the request's `callback` (form `xdr=`)     |
+| `sep7HandlerUrl()`      | wrap a request for a hosted receiving page (`handlerUrl` in the result)  |
+
 #### Claimable-balance delivery
 
 For a recipient who isn't ready at all, a payment bounces. The exchange sends a

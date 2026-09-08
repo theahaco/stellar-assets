@@ -113,31 +113,112 @@ Refusals are typed, straight from the authorizer contract:
 | 409  | `no_trustline`        | create the trustline first (the onboard router does both in one transaction) |
 | 503  | `authorizer_paused`   | issuer emergency stop — retry later                                          |
 | 502  | `chain_error`         | RPC / network trouble — safe to retry                                        |
+| 429  | `rate_limited`        | per-IP request budget exhausted — back off and retry                         |
+| 503  | `too_busy`            | instance at its concurrency cap — retry with backoff                         |
+
+### SEP-7 handoff — `POST /v1/sep7/request`, `POST /v1/sep7/callback`, `GET /.well-known/stellar.toml`
+
+The relayer is also the **integrator backend for the SEP-7 handoff** (full
+workflow: [sep7-handoff.md](sep7-handoff.md)).
+
+`POST /v1/sep7/request` — JSON
+`{ "account": "G…|C…", "asset": "CODE", "msg": "…" }`. Builds the one-signature
+onboard transaction for `account`, wraps it in a `web+stellar:tx` request
+**signed** as `SEP7_ORIGIN_DOMAIN`, with `callback` pointing back at this
+relayer, and returns:
+
+```json
+{
+	"account": "G...",
+	"asset": "EURCV",
+	"alreadyAuthorized": false,
+	"sep7Uri": "web+stellar:tx?xdr=...&callback=url%3A...&origin_domain=...&signature=...",
+	"handlerUrl": "https://authline.io/app.html?sep7=...",
+	"callback": "https://authline-relayer.fly.dev/v1/sep7/callback",
+	"signed": true,
+	"originDomain": "authline-relayer.fly.dev",
+	"expiresAt": "2026-09-04T12:03:00.000Z"
+}
+```
+
+`alreadyAuthorized: true` (no request) for a ready account; `409 no_account` for
+an unfunded G-account. No token: it costs no fee, only RPC reads.
+
+`POST /v1/sep7/callback` — form-encoded `xdr=<signed envelope>` (SEP-7) or JSON
+`{ "xdr": "…" }`. Called by the **user's wallet**, so no token; instead it
+accepts exactly one transaction shape — the pinned router's
+`onboard(<pinned SAC>, holder)` — holder-sourced and already signed (submit
+only), or relayer-sourced for a smart-account holder with address-credential
+auth entries only (countersign + submit, fee-capped). Everything else is
+`400 not_countersignable`. Answers like `/authorize`:
+`{ account, asset, authorized, alreadyAuthorized, txHash }`. Enabled by default
+on a loopback bind; `ALLOW_SEP7_CALLBACK=1` elsewhere.
+
+`POST /v1/claimable/send` — JSON
+`{ "account": "G…", "asset": "CODE", "amount": "25" }`. Pays `amount` from the
+relayer's own treasury as a claimable balance naming `account` (30-day reclaim),
+for a recipient who cannot receive a payment yet. Returns
+`{ balanceId, txHash, claimUrl }`; `claimUrl` is the activation page where the
+user claims it. Capped per request by `CLAIMABLE_MAX_AMOUNT`. The relayer must
+hold the asset: `npm run fund:treasury -- --relayer <alias>` funds a testnet
+relayer with USDC and EURCV from the keystore identities.
+
+`GET /.well-known/stellar.toml` — publishes `URI_REQUEST_SIGNING_KEY`, the key
+wallets verify request signatures against. This is why `SEP7_ORIGIN_DOMAIN` must
+be the relayer's own public host.
+
+All responses carry permissive CORS headers (bearer auth, never cookies), so a
+wallet page in a browser can call the callback.
 
 ## 3. Configuration
 
 Environment variables, read once at boot (the process refuses to start
 half-configured):
 
-| Variable            | Required | Meaning                                                              |
-| ------------------- | -------- | -------------------------------------------------------------------- |
-| `RELAYER_SECRET`    | yes      | `S...` secret of a **funded, low-privilege** operations account      |
-| `STELLAR_NETWORK`   | no       | `TESTNET` (default) or `PUBLIC`                                      |
-| `RPC_URL`           | no       | Stellar RPC override (defaults per network)                          |
-| `RELAYER_API_TOKEN` | no       | when set, `POST /authorize` requires `Authorization: Bearer <token>` |
-| `DEFAULT_ASSET`     | no       | asset code when `?asset=` is omitted (default `EURCV`)               |
-| `PORT`              | no       | listen port (default `8787`)                                         |
+| Variable               | Required | Meaning                                                                                              |
+| ---------------------- | -------- | ---------------------------------------------------------------------------------------------------- |
+| `RELAYER_SECRET`       | yes      | `S...` secret of a **funded, low-privilege** operations account                                      |
+| `RELAYER_API_TOKEN`    | yes\*    | Bearer token for `POST /authorize`, **min 16 chars**. \*Optional only when `HOST` is loopback        |
+| `STELLAR_NETWORK`      | no       | `TESTNET` (default) or `PUBLIC`                                                                      |
+| `RPC_URL`              | no       | Stellar RPC override (defaults per network)                                                          |
+| `DEFAULT_ASSET`        | no       | asset code when `?asset=` is omitted (default `EURCV`)                                               |
+| `PORT`                 | no       | listen port (default `8787`)                                                                         |
+| `HOST`                 | no       | bind interface (default `0.0.0.0`)                                                                   |
+| `RATE_LIMIT_RPM`       | no       | per-IP requests/minute on the `/v1` routes (default `120`, `0` disables)                             |
+| `MAX_INFLIGHT`         | no       | max concurrent `/v1` requests, `503 too_busy` beyond (default `8`, `0` disables)                     |
+| `TRUST_PROXY`          | no       | `1`/`true`: client IP from `Fly-Client-IP` / `X-Forwarded-For` — **only behind a trusted proxy**     |
+| `SEP7_ORIGIN_DOMAIN`   | no       | this relayer's public host (bare domain). Set → SEP-7 requests are signed; unset → unsigned          |
+| `SEP7_SIGNING_SECRET`  | no       | dedicated `S...` key for request signing (default: the relayer key; signing a URI grants nothing)    |
+| `SEP7_PUBLIC_URL`      | no       | public base URL for the `callback` (default `https://<SEP7_ORIGIN_DOMAIN>`, else `http://host:port`) |
+| `SEP7_HANDLER_BASE`    | no       | receiving page for `handlerUrl` (default `https://authline.io/app.html`)                             |
+| `ALLOW_SEP7_CALLBACK`  | no       | `1`/`true` serves `POST /v1/sep7/callback` (default: only on a loopback bind)                        |
+| `SEP7_MAX_FEE_STROOPS` | no       | highest fee the callback countersigns for a smart-account holder (default `5000000` = 0.5 XLM)       |
 
 **The key.** `authorize_trustline` is permissionless, so the relayer's account
 has exactly one job: paying transaction fees. Use a dedicated operations account
 holding a few XLM — **never** the authorizer admin key and never the asset
 issuer key. If the key leaks, the attacker can spend your fee balance; they gain
-no authority over the asset.
+no authority over the asset. Both bans are enforced at boot: the relayer
+**refuses to start** if `RELAYER_SECRET` is a pinned asset's issuer key (checked
+offline against the registry) or an authorizer admin key (checked by simulating
+each pinned authorizer's `admin()`; an unreachable RPC only warns, so an outage
+cannot keep a correct configuration down).
 
-**The token.** Reads are free; writes cost you fees. On a public instance set
-`RELAYER_API_TOKEN` so strangers cannot drain the fee balance by spamming
-`/authorize`. (Each spam authorize is harmless on-chain — it is your XLM they
-spend.)
+**The token.** Reads are free; writes cost you fees. The token is required
+unless the service binds a loopback interface (`HOST=127.0.0.1` for local
+development): an open `POST /authorize` lets anyone spend the fee balance. The
+comparison is constant-time, and a token under 16 characters is refused at boot.
+The token is **fee-abuse protection, never a compliance control** — the contract
+refuses ineligible accounts no matter who asks.
+
+**The limits.** Both `/v1` routes hit RPC on your quota, and an authorize can
+block up to 60 s awaiting confirmation, so the service ships with per-IP rate
+limiting (`429 rate_limited`) and a concurrency cap (`503 too_busy`); both are
+safe to retry with backoff. `/healthz` is exempt so platform health checks never
+queue behind chain work. Concurrent authorizes for the same account coalesce
+into one submission, so a burst of identical requests costs one fee. Limits are
+per-process — replicas behind a load balancer each apply their own, and edge
+rate limiting can still be layered in front.
 
 ## 4. Running it
 
@@ -154,7 +235,8 @@ self-host instead (below) with their own fee account and token.
 ```bash
 npm install
 npm run build -w @theahaco/authline-relayer
-RELAYER_SECRET=S... node packages/relayer/dist/server.js
+# Local development: loopback bind, no token needed.
+RELAYER_SECRET=S... HOST=127.0.0.1 node packages/relayer/dist/server.js
 ```
 
 ### Docker (self-hosting)
@@ -168,14 +250,15 @@ docker build -f packages/relayer/Dockerfile -t authline-relayer .
 docker run -p 8787:8787 \
   -e RELAYER_SECRET=S... \
   -e STELLAR_NETWORK=TESTNET \
-  -e RELAYER_API_TOKEN=change-me \
+  -e RELAYER_API_TOKEN=change-me-16-chars-min \
   authline-relayer
 ```
 
 The container is stateless — every answer comes from the ledger via RPC — so run
 as many replicas as you like behind any HTTP load balancer; no shared state, no
-sticky sessions. Concurrent authorizes for the same account are safe: the second
-lands as `alreadyAuthorized` or as a same-ledger no-op.
+sticky sessions. Concurrent authorizes for the same account are safe: within one
+process they coalesce into a single submission; across replicas the second lands
+as `alreadyAuthorized` or as a same-ledger no-op.
 
 ### Smoke test
 
@@ -190,6 +273,10 @@ curl -s localhost:8787/v1/accounts/GCB6N27Y6GTTMRBUQNYROIB5C37PWAJKLFRL7U3JXFZF7
 - **Fee balance.** The relayer account pays ~0.00001 XLM per authorize plus
   Soroban resource fees. Alert when its balance drops below ~5 XLM
   (`GET /healthz` names the account; watch it in Horizon/RPC).
+- **Reserves and float.** Case B locks ~1–1.5 XLM of the relayer's balance per
+  sponsored holder until the sponsored entries are removed, and
+  `/v1/claimable/send` spends the treasury's asset balances. Watch both; the
+  testnet instance is refilled with `npm run fund:treasury`.
 - **Failure modes.** `503 authorizer_paused` means the issuer pulled the
   emergency brake — that is policy working, not an outage. `502 chain_error` is
   RPC trouble; the service holds no state, so restart/retry freely.

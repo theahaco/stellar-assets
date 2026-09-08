@@ -21,6 +21,7 @@ export default defineConfig({
 			input: {
 				main: resolve(root, "index.html"), // Authline landing
 				app: resolve(root, "app.html"), // activation dApp
+				withdraw: resolve(root, "withdraw.html"), // reference integrator (SEP-7 handoff)
 			},
 		},
 	},

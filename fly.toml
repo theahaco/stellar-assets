@@ -9,6 +9,15 @@ primary_region = "cdg"
 [env]
   STELLAR_NETWORK = "TESTNET"
   PORT = "8787"
+  # Fly's proxy fronts every request and sets Fly-Client-IP; without this the
+  # per-IP rate limit would see the proxy's address for every client.
+  TRUST_PROXY = "1"
+  # SEP-7 handoff (docs/sep7-handoff.md): sign requests as this host — its
+  # /.well-known/stellar.toml publishes the key — and receive signed envelopes
+  # back from the user's wallet at /v1/sep7/callback.
+  SEP7_ORIGIN_DOMAIN = "authline-relayer.fly.dev"
+  SEP7_HANDLER_BASE = "https://authline.io/app.html"
+  ALLOW_SEP7_CALLBACK = "1"
 
 # RELAYER_SECRET and RELAYER_API_TOKEN are Fly secrets, never committed:
 #   fly secrets set RELAYER_SECRET=S... RELAYER_API_TOKEN=...

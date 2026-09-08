@@ -60,7 +60,10 @@ describe.skipIf(!RUN)(
 				networkPassphrase: NET.passphrase,
 				rpcUrl: NET.rpcUrl,
 				signer: relayerKey,
-				port: 0, // OS-assigned; read back from the listening socket
+				port: 0,
+				sep7Signer: relayerKey,
+				sep7PublicUrl: "http://127.0.0.1:8787",
+				sep7HandlerBase: "http://localhost:4173/app.html", // OS-assigned; read back from the listening socket
 				defaultAsset: "EURCV",
 			}
 			server = startServer(cfg, makeChainOps(cfg))

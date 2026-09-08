@@ -29,13 +29,21 @@ import {
 	buildClaimTx,
 	buildOnboardTx,
 	decodeOnboardStatus,
+	describeSep7Tx,
+	fetchSep7SigningKey,
 	findClaimableBalances,
 	getActivationStatus,
 	getClaimableBalance,
 	isValidIssuer,
+	parseSep7TxRequest,
 	planClaim,
+	postSep7Callback,
+	sep7Signer,
+	verifySep7Signature,
 	type ActivationStatus,
 	type ClaimableBalanceEntry,
+	type Sep7TxRequest,
+	type Sep7TxSummary,
 } from "@theahaco/authline"
 import { useCallback, useEffect, useRef, useState } from "react"
 import {
@@ -161,6 +169,7 @@ type Phase =
 	| "ready"
 	| "authorize" // trustline exists but is not authorized — offer the direct authorize call
 	| "claim" // a claimable balance is waiting and can be collected in one signature
+	| "sep7" // a web+stellar: request handed to this page — review it before signing
 	| "building"
 	| "signing"
 	| "submitting"
@@ -1085,20 +1094,126 @@ const preselectedAsset = (): AssetConfig | undefined => {
 	return LIVE_ASSETS.find((a) => a.assetCode === q)
 }
 
+// ── SEP-7 receiving end ──────────────────────────────────────────────
+/**
+ * A `web+stellar:tx` request handed to this page (`app.html?sep7=…`): a third
+ * party — an exchange's withdrawal screen, typically — built a transaction
+ * with `@theahaco/authline` and asks the user to sign it here with whichever
+ * wallet they connect. This page is the WALLET side of the SEP-7 handoff, for
+ * users whose wallet registers no `web+stellar:` handler of its own.
+ */
+interface Sep7Ctx {
+	req: Sep7TxRequest
+	summary: Sep7TxSummary
+	/** The account the request wants to sign. */
+	signer: string
+	/** The live asset it activates, when it is a router onboard for a pinned SAC. */
+	asset?: AssetConfig
+}
+type Sep7Verify =
+	| { state: "unsigned" } // no origin_domain — nothing to verify against
+	| { state: "checking" }
+	| { state: "verified"; key: string }
+	| { state: "unverified"; reason: string }
+	| { state: "forged" }
+
+function readSep7FromUrl(): { ctx: Sep7Ctx } | { error: string } | null {
+	// Read the raw query, not URLSearchParams: a request pasted UNENCODED into
+	// the URL would have its `+` (in `web+stellar` and in base64) read as spaces.
+	const m = /[?&]sep7=([^&#]*)/.exec(window.location.search)
+	if (!m) return null
+	const encoded = m[1] ?? ""
+	let raw: string
+	try {
+		raw = decodeURIComponent(encoded)
+	} catch {
+		raw = encoded
+	}
+	try {
+		const req = parseSep7TxRequest(raw, {
+			networkPassphrase: NETWORK.passphrase,
+		})
+		const summary = describeSep7Tx(req.xdr, NETWORK.passphrase)
+		// The asset this request activates: the router onboard's SAC (Case C),
+		// or the ChangeTrust inside a sponsored CAP-33 sandwich (Case B).
+		const sac = summary.onboard?.sac
+		const trust = summary.ops.find((o) => o.asset)?.asset
+		const asset = sac
+			? LIVE_ASSETS.find((a) => a.sac === sac)
+			: trust
+				? LIVE_ASSETS.find(
+						(a) => a.assetCode === trust.code && a.assetIssuer === trust.issuer,
+					)
+				: undefined
+		return { ctx: { req, summary, signer: sep7Signer(req, summary), asset } }
+	} catch (e) {
+		return {
+			error: `This link is not a signable SEP-7 request — ${
+				e instanceof Error ? e.message : String(e)
+			}.`,
+		}
+	}
+}
+const initialSep7Verify = (ctx: Sep7Ctx | null): Sep7Verify => {
+	if (!ctx?.req.originDomain) return { state: "unsigned" }
+	if (!ctx.req.signature)
+		return {
+			state: "unverified",
+			reason: `${ctx.req.originDomain} did not sign this request`,
+		}
+	return { state: "checking" }
+}
+const stroopsToXlm = (s: string) =>
+	(Number(s) / 1e7).toFixed(7).replace(/0+$/, "").replace(/\.$/, "")
+/** Offer to make this page the browser's web+stellar: handler (secure contexts only). */
+const canRegisterHandler = () =>
+	typeof navigator !== "undefined" &&
+	"registerProtocolHandler" in navigator &&
+	window.isSecureContext
+const registerSep7Handler = () => {
+	try {
+		navigator.registerProtocolHandler(
+			"web+stellar",
+			`${window.location.origin}${window.location.pathname}?sep7=%s`,
+		)
+	} catch (e) {
+		console.warn("registerProtocolHandler failed", e)
+	}
+}
+
 export function AuthlineApp() {
 	const [address, setAddress] = useState("")
+	// A SEP-7 request handed to this page (`?sep7=web+stellar:tx?…`) — read
+	// once; the page then acts as the receiving end of the handoff.
+	const [sep7] = useState(() => readSep7FromUrl())
+	const sep7Ctx = sep7 && "ctx" in sep7 ? sep7.ctx : null
 	// The asset being activated. Defaults to the env-configured asset; a
 	// ?asset=CODE deep link (landing page, partner docs) preselects any live
 	// asset and skips straight past the directory.
 	const [asset, setAsset] = useState<AssetConfig>(
-		() => preselectedAsset() ?? DEFAULT_ASSET,
+		() => sep7Ctx?.asset ?? preselectedAsset() ?? DEFAULT_ASSET,
 	)
 	const [phase, setPhase] = useState<Phase>(() =>
-		preselectedAsset() ? "idle" : "directory",
+		sep7
+			? sep7Ctx
+				? "sep7"
+				: "error"
+			: preselectedAsset()
+				? "idle"
+				: "directory",
 	)
 	const [showModal, setShowModal] = useState(false)
 	const [hash, setHash] = useState<string | null>(null)
-	const [errMsg, setErrMsg] = useState("")
+	const [errMsg, setErrMsg] = useState(() =>
+		sep7 && "error" in sep7 ? sep7.error : "",
+	)
+	// Provenance of the SEP-7 request: origin_domain signature verification.
+	const [sep7Verify, setSep7Verify] = useState<Sep7Verify>(() =>
+		initialSep7Verify(sep7Ctx),
+	)
+	// Whether the signed request went back to its sender's callback (which then
+	// submitted it) rather than being submitted from here.
+	const [sep7Returned, setSep7Returned] = useState(false)
 	// Truthful router outcome: trustline created but NOT authorized (the asset
 	// has no one-step authorizer) — drives the success copy.
 	const [trustlineOnly, setTrustlineOnly] = useState(false)
@@ -1198,6 +1313,7 @@ export function AuthlineApp() {
 	// ?address=… read-only preview
 	useEffect(() => {
 		let cancelled = false
+		if (sep7) return // a SEP-7 request owns the page: no preview, no prompt
 		const a = new URLSearchParams(window.location.search).get("address")
 		if (a && (isValidIssuer(a) || StrKey.isValidContract(a))) {
 			const gen = statusGen.current
@@ -1241,6 +1357,7 @@ export function AuthlineApp() {
 	// already carries its own wallet context (same validation as the preview
 	// effect — a malformed param must not silently suppress the prompt).
 	useEffect(() => {
+		if (sep7) return // the request screen has its own connect button
 		const a = new URLSearchParams(window.location.search).get("address")
 		if (a && (isValidIssuer(a) || StrKey.isValidContract(a))) return
 		if (isConnected.current || address) return
@@ -1255,6 +1372,39 @@ export function AuthlineApp() {
 		// Mount-only: re-running would reopen the modal on every state change.
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [])
+
+	// Verify the SEP-7 request's provenance: fetch origin_domain's stellar.toml
+	// and check `signature` against URI_REQUEST_SIGNING_KEY. Best-effort — a
+	// toml this browser cannot read (CORS, offline) is "unverified", never
+	// "forged"; only a key that exists and does NOT match is forged.
+	useEffect(() => {
+		const originDomain = sep7Ctx?.req.originDomain
+		const uri = sep7Ctx?.req.uri
+		if (!originDomain || !uri || !sep7Ctx?.req.signature) return
+		let cancelled = false
+		fetchSep7SigningKey(originDomain)
+			.then((key) => {
+				if (cancelled) return
+				if (!key)
+					setSep7Verify({
+						state: "unverified",
+						reason: `${originDomain} publishes no URI_REQUEST_SIGNING_KEY`,
+					})
+				else if (verifySep7Signature(uri, key))
+					setSep7Verify({ state: "verified", key })
+				else setSep7Verify({ state: "forged" })
+			})
+			.catch(() => {
+				if (!cancelled)
+					setSep7Verify({
+						state: "unverified",
+						reason: `could not read ${originDomain}’s stellar.toml from this browser`,
+					})
+			})
+		return () => {
+			cancelled = true
+		}
+	}, [sep7Ctx])
 
 	// Background prep for smart-account activation: fund the session fee payer
 	// (once) and pre-build the onboard tx, so that when the user clicks
@@ -1310,6 +1460,7 @@ export function AuthlineApp() {
 				phase === "directory" ||
 				(phase === "error" && !address && failedFromDirectory.current)
 			setShowModal(false)
+			let addrForSep7: string | undefined
 			try {
 				const e2e = e2eSigner()
 				let addr: string
@@ -1326,6 +1477,7 @@ export function AuthlineApp() {
 					addr = (await StellarWalletsKit.fetchAddress()).address
 				}
 				if (gen !== statusGen.current) return
+				addrForSep7 = addr
 				isConnected.current = true
 				setAddress(addr)
 				setStatus(null)
@@ -1336,7 +1488,9 @@ export function AuthlineApp() {
 				if (gen !== statusGen.current) return
 				if (classicReadOk(st)) {
 					setStatus(st)
-					if (fromDirectory) {
+					if (sep7Ctx) {
+						setPhase("sep7") // back to the request, now with a wallet to sign
+					} else if (fromDirectory) {
 						setPhase("directory")
 					} else {
 						setPhase(phaseFor(st, asset))
@@ -1345,6 +1499,8 @@ export function AuthlineApp() {
 						if (st.holderKind === "contract" && !st.sacAuthorized)
 							void prepareSmartActivation(addr, asset)
 					}
+				} else if (sep7Ctx) {
+					setPhase("sep7")
 				} else if (fromDirectory) {
 					setPhase("directory")
 				} else {
@@ -1355,6 +1511,16 @@ export function AuthlineApp() {
 				}
 			} catch (e) {
 				if (gen !== statusGen.current) return
+				// A SEP-7 request needs the wallet, not a status read: an account
+				// that does not exist yet (Case B — sponsored creation) reads as an
+				// error here, and the request is still perfectly signable.
+				if (sep7Ctx && addrForSep7) {
+					isConnected.current = true
+					setAddress(addrForSep7)
+					setStatus(null)
+					setPhase("sep7")
+					return
+				}
 				// The kit's selected module already switched — without a rollback,
 				// "Try again" would pair the PREVIOUS address with the NEW module
 				// (wrong-wallet signing). Clear the pairing instead — INCLUDING the
@@ -1371,7 +1537,14 @@ export function AuthlineApp() {
 				setPhase("error")
 			}
 		},
-		[asset, phase, address, prepareSmartActivation, loadDirectoryStatuses],
+		[
+			asset,
+			phase,
+			address,
+			sep7Ctx,
+			prepareSmartActivation,
+			loadDirectoryStatuses,
+		],
 	)
 
 	const pick = (t: DirItem) => {
@@ -1432,7 +1605,13 @@ export function AuthlineApp() {
 		// Decide from the latest ledger read (refreshed after every submit), so a
 		// freshly activated account lands on "already" — not the Activate CTA.
 		setPhase(
-			address ? (status ? phaseFor(status, asset) : "ready") : "directory",
+			sep7Ctx
+				? "sep7"
+				: address
+					? status
+						? phaseFor(status, asset)
+						: "ready"
+					: "directory",
 		)
 	}
 
@@ -1475,7 +1654,9 @@ export function AuthlineApp() {
 	// Which flow produced the current success/error screen. Without this the
 	// error heading is always the activation one ("Couldn't create trustline"),
 	// which is actively misleading after a failed CLAIM.
-	const [flow, setFlow] = useState<"activate" | "claim">("activate")
+	const [flow, setFlow] = useState<"activate" | "claim" | "sep7">(
+		sep7 ? "sep7" : "activate",
+	)
 	// The amount claimed, for the success screen.
 	const claimedAmount = useRef("")
 
@@ -1731,6 +1912,67 @@ export function AuthlineApp() {
 		}
 	}, [address, asset, refreshStatus])
 
+	// Sign the SEP-7 request with the connected wallet and deliver it the way
+	// the request asked: to its `callback` (the sender submits — and, for a
+	// smart-account holder, countersigns as fee source first) or straight to
+	// the network.
+	const signSep7 = useCallback(async () => {
+		if (!sep7Ctx) return
+		const { req, summary, signer } = sep7Ctx
+		setFlow("sep7")
+		statusGen.current++
+		setErrMsg("")
+		setTrustlineOnly(false)
+		setSep7Returned(false)
+		try {
+			if (address !== signer)
+				throw new Error(
+					`This request is for ${short(signer, 6, 6)}, but the connected ` +
+						`wallet is ${short(address, 6, 6)}.`,
+				)
+			const others = summary.signers.filter((s) => s !== signer)
+			if (others.length > 0 && summary.signatures === 0 && !req.callback)
+				throw new Error(
+					"This transaction also needs a signature from " +
+						`${others.map((s) => short(s, 6, 6)).join(", ")}, and the ` +
+						"request names no callback to return it through. Ask the " +
+						"sender to countersign first, or to set a callback.",
+				)
+			setPhase("signing")
+			const signed = await signTx(req.xdr, address)
+			setPhase("submitting")
+			let h: string | null = null
+			if (req.callback) {
+				const { body } = await postSep7Callback(req.callback, signed)
+				const b = body as { txHash?: unknown; hash?: unknown } | null
+				const got =
+					b && typeof b === "object" ? (b.txHash ?? b.hash) : undefined
+				h = typeof got === "string" ? got : null
+				setSep7Returned(true)
+			} else {
+				const res = await submitAndConfirm(signed)
+				h = res.hash
+				if (summary.onboard) {
+					const outcome = decodeOnboardStatus(res.returnValue)
+					setTrustlineOnly(
+						outcome
+							? outcome === "TrustlineOnly"
+							: sep7Ctx.asset
+								? !isOpen(sep7Ctx.asset)
+								: false,
+					)
+				}
+			}
+			if (sep7Ctx.asset) await refreshStatus(address, sep7Ctx.asset)
+			setHash(h)
+			setPhase("success")
+		} catch (e) {
+			if (sep7Ctx.asset) void refreshStatus(address, sep7Ctx.asset)
+			setErrMsg(e instanceof Error ? e.message : String(e))
+			setPhase("error")
+		}
+	}, [sep7Ctx, address, refreshStatus])
+
 	const busy =
 		phase === "building" || phase === "signing" || phase === "submitting"
 
@@ -1763,6 +2005,260 @@ export function AuthlineApp() {
 				statuses={Object.keys(dirStatuses).length > 0 ? dirStatuses : undefined}
 				pendingCounts={pendingCounts}
 			/>
+		)
+	} else if (phase === "sep7" && sep7Ctx) {
+		const { req, summary, signer } = sep7Ctx
+		const others = summary.signers.filter((s) => s !== signer)
+		const connectedHere = !!address && isConnected.current
+		const mismatch = connectedHere && address !== signer
+		const alreadyDone =
+			!!sep7Ctx.asset && !!status && isAuthorizedStatus(status)
+		const provenance =
+			sep7Verify.state === "verified" ? (
+				<Pill accent>Verified</Pill>
+			) : sep7Verify.state === "forged" ? (
+				<Pill tone="err">Bad signature</Pill>
+			) : sep7Verify.state === "checking" ? (
+				<Pill>
+					<Spinner size={10} /> Checking
+				</Pill>
+			) : sep7Verify.state === "unverified" ? (
+				<Pill tone="warn">Unverified</Pill>
+			) : (
+				<Pill tone="warn">Unsigned</Pill>
+			)
+		const note: React.CSSProperties = {
+			fontFamily: AL.disp,
+			fontSize: 12.5,
+			lineHeight: 1.5,
+			color: AL.mut,
+			margin: "12px 0 0",
+		}
+		body = (
+			<div className="al-fade">
+				{sep7Ctx.asset && (
+					<AssetRow
+						asset={sep7Ctx.asset}
+						status={<Pill accent>Request</Pill>}
+					/>
+				)}
+				<div
+					style={{
+						background: "rgba(46,111,168,0.08)",
+						border: "1px solid rgba(46,111,168,0.28)",
+						borderRadius: 12,
+						padding: "11px 13px",
+						marginBottom: 14,
+						fontFamily: AL.disp,
+						fontSize: 12.5,
+						lineHeight: 1.45,
+						color: AL.mut,
+					}}
+				>
+					<div
+						style={{
+							display: "flex",
+							justifyContent: "space-between",
+							alignItems: "center",
+							gap: 10,
+						}}
+					>
+						<span>
+							From{" "}
+							<b style={{ color: AL.ink }}>
+								{req.originDomain ?? "an unknown sender"}
+							</b>
+						</span>
+						{provenance}
+					</div>
+					{req.msg && (
+						<div style={{ marginTop: 6, color: AL.ink, fontStyle: "italic" }}>
+							“{req.msg}”
+						</div>
+					)}
+					{sep7Verify.state === "unverified" && (
+						<div style={{ marginTop: 6 }}>
+							{sep7Verify.reason}. Check what you are signing below.
+						</div>
+					)}
+					{sep7Verify.state === "forged" && (
+						<div style={{ marginTop: 6, color: "#B5532E" }}>
+							The signature does not match {req.originDomain}’s published key.
+							Signing is disabled.
+						</div>
+					)}
+					{sep7Verify.state === "unsigned" && (
+						<div style={{ marginTop: 6 }}>
+							The request names no origin domain, so its sender cannot be
+							verified. Check what you are signing below.
+						</div>
+					)}
+				</div>
+				<div
+					style={{
+						display: "flex",
+						flexDirection: "column",
+						gap: 11,
+						padding: "15px 0",
+						borderTop: `1px solid ${AL.line}`,
+						borderBottom: `1px solid ${AL.line}`,
+					}}
+				>
+					<KV
+						k="You sign"
+						v={
+							sep7Ctx.asset
+								? `Activate ${sep7Ctx.asset.assetCode}${
+										summary.ops.some(
+											(o) => o.type === "beginSponsoringFutureReserves",
+										)
+											? " (reserve sponsored)"
+											: ""
+									}`
+								: summary.onboard
+									? "Activate an asset"
+									: `${summary.ops.length} operation${
+											summary.ops.length === 1 ? "" : "s"
+										}`
+						}
+						accent={AL.emeraldBright}
+						mono={false}
+					/>
+					<KV
+						k="For account"
+						v={short(signer, 6, 6)}
+						accent={mismatch ? "#B5532E" : undefined}
+					/>
+					<KV
+						k="Network"
+						v={IS_PUBLIC ? "Stellar · Mainnet" : "Stellar · Testnet"}
+						mono={false}
+					/>
+					<KV k="Max fee" v={`${stroopsToXlm(summary.fee)} XLM`} />
+					{others.length > 0 && (
+						<KV
+							k="Also signed by"
+							v={others.map((o) => short(o, 4, 4)).join(", ")}
+						/>
+					)}
+					<KV
+						k="Then"
+						v={
+							req.callback
+								? "Returned to the sender"
+								: "Submitted to the network"
+						}
+						mono={false}
+					/>
+				</div>
+				<details
+					style={{
+						margin: "12px 0 0",
+						fontFamily: AL.mono,
+						fontSize: 11,
+						color: AL.mut,
+					}}
+				>
+					<summary
+						style={{ cursor: "pointer", fontFamily: AL.disp, fontSize: 12.5 }}
+					>
+						Transaction detail
+					</summary>
+					<ul
+						style={{
+							margin: "8px 0 0",
+							paddingLeft: 16,
+							lineHeight: 1.6,
+							wordBreak: "break-all",
+						}}
+					>
+						{summary.ops.map((op, i) => (
+							<li key={i}>
+								{op.type}
+								{op.contract
+									? ` · ${short(op.contract, 6, 6)}.${op.function}(${(
+											op.args ?? []
+										)
+											.map((a) =>
+												typeof a === "string" && a.length > 20
+													? short(a, 6, 6)
+													: String(a),
+											)
+											.join(", ")})`
+									: ""}
+								{op.detail ? ` · ${op.detail}` : ""}
+							</li>
+						))}
+					</ul>
+					<div
+						style={{
+							marginTop: 8,
+							wordBreak: "break-all",
+							maxHeight: 96,
+							overflowY: "auto",
+							padding: 8,
+							background: AL.paper,
+							borderRadius: 8,
+						}}
+					>
+						{req.uri}
+					</div>
+				</details>
+				{alreadyDone && (
+					<p style={note}>
+						This account is already authorized for {sep7Ctx.asset?.assetCode}.
+						Signing again is harmless but changes nothing.
+					</p>
+				)}
+				{mismatch && (
+					<p style={{ ...note, color: "#B5532E" }}>
+						This request is for {short(signer, 6, 6)}, but the connected wallet
+						is {short(address, 6, 6)}. Switch to the wallet that holds that
+						account.
+					</p>
+				)}
+				<div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+					<Ghost full onClick={toDirectory}>
+						Decline
+					</Ghost>
+					{!connectedHere ? (
+						<Primary
+							onClick={() =>
+								e2eSigner() ? connect("e2e") : setShowModal(true)
+							}
+						>
+							Connect wallet to sign
+						</Primary>
+					) : mismatch ? (
+						<Primary onClick={switchWallet}>Switch wallet</Primary>
+					) : (
+						<Primary
+							onClick={signSep7}
+							disabled={sep7Verify.state === "forged"}
+						>
+							Sign · 1 signature
+						</Primary>
+					)}
+				</div>
+				{canRegisterHandler() && (
+					<button
+						className="al-link"
+						onClick={registerSep7Handler}
+						style={{
+							background: "none",
+							border: "none",
+							cursor: "pointer",
+							padding: 0,
+							marginTop: 14,
+							fontFamily: AL.disp,
+							fontSize: 12,
+							color: AL.mut,
+						}}
+					>
+						Open future web+stellar: links here
+					</button>
+				)}
+			</div>
 		)
 	} else if (phase === "idle") {
 		body = (
@@ -2275,11 +2771,13 @@ export function AuthlineApp() {
 					>
 						{flow === "claim"
 							? `${claimedAmount.current} ${asset.assetCode} claimed`
-							: isSmartAccount(address)
-								? `${asset.assetCode} activated for your smart account`
-								: trustlineOnly
-									? `${asset.assetCode} trustline created`
-									: `${asset.assetCode} trustline authorized`}
+							: flow === "sep7" && !sep7Ctx?.asset
+								? "Request signed"
+								: isSmartAccount(address)
+									? `${asset.assetCode} activated for your smart account`
+									: trustlineOnly
+										? `${asset.assetCode} trustline created`
+										: `${asset.assetCode} trustline authorized`}
 					</div>
 					<div
 						style={{
@@ -2293,6 +2791,12 @@ export function AuthlineApp() {
 							<>
 								The balance is in your wallet, and your {asset.assetCode}{" "}
 								trustline is open.
+							</>
+						) : sep7Returned ? (
+							<>
+								Your signature went back to{" "}
+								{sep7Ctx?.req.originDomain ?? "the sender"}, which submitted the
+								transaction.
 							</>
 						) : trustlineOnly ? (
 							<>
@@ -2319,9 +2823,11 @@ export function AuthlineApp() {
 						v={
 							flow === "claim"
 								? "● Claimed"
-								: trustlineOnly
-									? "● Trustline created"
-									: "● Authorized"
+								: flow === "sep7" && !sep7Ctx?.asset
+									? "● Signed"
+									: trustlineOnly
+										? "● Trustline created"
+										: "● Authorized"
 						}
 						accent={AL.emeraldBright}
 						mono={false}
@@ -2431,7 +2937,9 @@ export function AuthlineApp() {
 						>
 							{flow === "claim"
 								? "Couldn’t claim your balance"
-								: errorHeading(asset)}
+								: flow === "sep7"
+									? "Couldn’t complete the request"
+									: errorHeading(asset)}
 						</div>
 						<div
 							style={{
@@ -2477,20 +2985,24 @@ export function AuthlineApp() {
 					    address — the pairing was cleared) re-opens the wallet picker;
 					    an existing unauthorized trustline retries the direct authorize
 					    call; everything else retries the activation. */}
-					<Primary
-						onClick={
-							!address
-								? () => setShowModal(true)
-								: status &&
-									  status.hasTrustline &&
-									  !status.isAuthorized &&
-									  canAuthorize(asset)
-									? authorize
-									: activate
-						}
-					>
-						Try again
-					</Primary>
+					{!(sep7 && !sep7Ctx) && (
+						<Primary
+							onClick={
+								!address
+									? () => setShowModal(true)
+									: flow === "sep7"
+										? signSep7
+										: status &&
+											  status.hasTrustline &&
+											  !status.isAuthorized &&
+											  canAuthorize(asset)
+											? authorize
+											: activate
+							}
+						>
+							Try again
+						</Primary>
+					)}
 				</div>
 			</div>
 		)
@@ -2499,8 +3011,14 @@ export function AuthlineApp() {
 	// The wallet stays connected across "‹ All assets" — the header pill must
 	// keep showing it in the directory, not pretend the user disconnected.
 	const connected = !!address && isConnected.current
-	const head =
-		phase === "directory"
+	const head = sep7Ctx
+		? {
+				t: "Sign a request",
+				s: sep7Ctx.asset
+					? `${sep7Ctx.req.originDomain ?? "A third party"} asks you to activate ${sep7Ctx.asset.assetCode} — one signature.`
+					: `${sep7Ctx.req.originDomain ?? "A third party"} asks for your signature.`,
+			}
+		: phase === "directory"
 			? {
 					t: "Activate a Stellar asset",
 					s: `One signature to hold any supported asset — ${
@@ -2685,7 +3203,7 @@ export function AuthlineApp() {
 					{/* Always reachable way back to the asset list (wallet connection
 					    kept) — except mid-flight, where abandoning a signing/submitting
 					    transaction would mislead. */}
-					{phase !== "directory" && !busy && (
+					{phase !== "directory" && phase !== "sep7" && !busy && (
 						<button
 							className="al-link"
 							onClick={toDirectory}
